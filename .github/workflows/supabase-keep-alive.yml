@@ -1,0 +1,157 @@
+# Prevents Supabase free-tier projects from auto-pausing after ~7 days of database inactivity.
+# Auth/health endpoints do NOT count — this workflow issues a minimal REST SELECT so Postgres sees activity.
+name: Supabase Keep-Alive
+
+on:
+  schedule:
+    # Daily at 02:37 UTC (08:07 IST) — well under the 7-day inactivity window.
+    - cron: "37 2 * * *"
+  workflow_dispatch:
+    inputs:
+      verbose:
+        description: Print response body on success
+        required: false
+        default: false
+        type: boolean
+      force_heartbeat:
+        description: Push a heartbeat commit even if the repo is not quiet yet
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: supabase-keep-alive
+  cancel-in-progress: false
+
+jobs:
+  ping-database:
+    name: Ping Supabase database
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Validate secrets and configuration
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          KEEP_ALIVE_TABLE: ${{ vars.KEEP_ALIVE_TABLE }}
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [ -z "${SUPABASE_URL:-}" ] && missing+=("SUPABASE_URL")
+          [ -z "${SUPABASE_ANON_KEY:-}" ] && missing+=("SUPABASE_ANON_KEY")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required GitHub Actions secrets: ${missing[*]}"
+            echo "Add them at: Settings → Secrets and variables → Actions → Secrets"
+            exit 1
+          fi
+
+          case "$SUPABASE_URL" in
+            https://*.supabase.co) ;;
+            *)
+              echo "::warning::SUPABASE_URL does not look like a standard Supabase project URL"
+              ;;
+          esac
+
+          # ai_pricing has RLS on and no anon policy: the query hits Postgres and returns []. Override via repo variable KEEP_ALIVE_TABLE.
+          TABLE="${KEEP_ALIVE_TABLE:-ai_pricing}"
+          echo "KEEP_ALIVE_TABLE=${TABLE}" >> "$GITHUB_ENV"
+          echo "Using table: ${TABLE}"
+
+      - name: Ping Postgres via REST API
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          VERBOSE: ${{ inputs.verbose }}
+        run: |
+          set -euo pipefail
+
+          ENDPOINT="${SUPABASE_URL%/}/rest/v1/${KEEP_ALIVE_TABLE}?select=id&limit=1"
+          echo "Request: GET ${ENDPOINT%%\?*}?select=id&limit=1"
+
+          RESPONSE_FILE=$(mktemp)
+          trap 'rm -f "$RESPONSE_FILE"' EXIT
+
+          if ! HTTP_STATUS=$(curl -sS --max-time 30 --retry 2 --retry-delay 5 \
+            -o "$RESPONSE_FILE" -w "%{http_code}" \
+            -H "apikey: ${SUPABASE_ANON_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_ANON_KEY}" \
+            -H "Accept: application/json" \
+            -H "Prefer: count=none" \
+            "$ENDPOINT"); then
+            echo "::error::curl failed (network, DNS, or timeout)"
+            [ -s "$RESPONSE_FILE" ] && cat "$RESPONSE_FILE"
+            exit 1
+          fi
+
+          echo "HTTP ${HTTP_STATUS}"
+
+          case "$HTTP_STATUS" in
+            200|204)
+              echo "Keep-alive succeeded — database activity recorded."
+              if [ "${VERBOSE}" = "true" ]; then
+                echo "Response body:"
+                cat "$RESPONSE_FILE"
+              fi
+              ;;
+            401|403)
+              echo "::error::Authentication failed (HTTP ${HTTP_STATUS}). Check SUPABASE_ANON_KEY."
+              cat "$RESPONSE_FILE"
+              exit 1
+              ;;
+            404)
+              echo "::error::Table '${KEEP_ALIVE_TABLE}' not found (HTTP 404). Check KEEP_ALIVE_TABLE or restore the database schema."
+              cat "$RESPONSE_FILE"
+              exit 1
+              ;;
+            *)
+              echo "::error::Unexpected HTTP ${HTTP_STATUS}"
+              cat "$RESPONSE_FILE"
+              exit 1
+              ;;
+          esac
+
+  # GitHub auto-disables scheduled workflows after 60 days of REPOSITORY inactivity.
+  # Workflow runs do not count as activity — only pushes do. This job pushes a dated
+  # heartbeat file whenever the repo has been quiet for 3 weeks, so the 60-day timer
+  # never expires and the cron above never silently dies.
+  refresh-repo-activity:
+    name: Refresh repo activity
+    needs: ping-database
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Push heartbeat commit if the repo has gone quiet
+        env:
+          FORCE_HEARTBEAT: ${{ inputs.force_heartbeat }}
+        run: |
+          set -euo pipefail
+
+          QUIET_DAYS_THRESHOLD=21
+
+          LAST_COMMIT_EPOCH=$(git log -1 --format=%ct)
+          DAYS_QUIET=$(( ( $(date +%s) - LAST_COMMIT_EPOCH ) / 86400 ))
+          echo "Days since last commit: ${DAYS_QUIET} (threshold: ${QUIET_DAYS_THRESHOLD})"
+
+          if [ "$DAYS_QUIET" -lt "$QUIET_DAYS_THRESHOLD" ] && [ "${FORCE_HEARTBEAT}" != "true" ]; then
+            echo "Repository is active — no heartbeat needed."
+            exit 0
+          fi
+
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .github/keep-alive-heartbeat
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keep-alive-heartbeat
+          git commit -m "chore(ci): heartbeat to keep scheduled workflows enabled"
+          git push
+
+          echo "::notice::Pushed heartbeat — Actions inactivity timer reset."
