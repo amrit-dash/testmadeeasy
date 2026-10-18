@@ -12,7 +12,7 @@ import path from "path";
 import fs from "fs";
 import pRetry from "p-retry";
 import pLimit from "p-limit";
-import { calculateAiCost, getAiPricingChart, getMaxOutputTokens } from "./ai-pricing";
+import { calculateAiCost, getAiPricingChart, getMaxOutputTokens, isGemmaModel } from "./ai-pricing";
 import { fetchAndUpdatePricingChart } from "../scripts/update-pricing";
 import { SYSTEM_SETTINGS, updateSystemSettings } from "./system-settings";
 import { createJob, updateJob, getUserJobs, getJob, deleteJob, deleteCompletedJobs } from "./jobs";
@@ -47,6 +47,60 @@ function getAi(): GoogleGenAI {
     });
   }
   return aiClient;
+}
+
+// Models return boxes as [ymin, xmin, ymax, xmax] on a 0-1000 grid (the format Gemma and
+// Gemini are trained on). The rest of the app stores {x, y, width, height} in percent.
+function boxToBounds(box: unknown, padPct: number): { x: number; y: number; width: number; height: number } | null {
+  if (!Array.isArray(box) || box.length !== 4 || !box.every((v) => typeof v === "number" && isFinite(v))) return null;
+  const [ymin, xmin, ymax, xmax] = box.map((v) => Math.min(1000, Math.max(0, v)) / 10);
+  if (ymax - ymin < 1 || xmax - xmin < 1) return null;
+  const x = Math.max(0, xmin - padPct);
+  const y = Math.max(0, ymin - padPct);
+  return { x, y, width: Math.min(100, xmax + padPct) - x, height: Math.min(100, ymax + padPct) - y };
+}
+
+function isUsableBounds(b: any): boolean {
+  return !!b && [b.x, b.y, b.width, b.height].every((v) => typeof v === "number" && v >= 0 && v <= 100) && b.width > 0 && b.height > 0;
+}
+
+type Box = [number, number, number, number];
+
+function asBox(b: unknown): Box | null {
+  return Array.isArray(b) && b.length === 4 && b.every((v) => typeof v === "number" && isFinite(v)) ? (b as Box) : null;
+}
+
+/**
+ * Convert questionBox/diagramBox to percent bounds and drop malformed legacy bounds.
+ * Models tend to stop the question box a line early, so each question box is grown to
+ * include its own diagram and to reach just above the next question in the same column.
+ */
+function normalizeQuestionBoxes(questions: any[]): any[] {
+  const items = questions.filter((q) => q && typeof q === "object");
+  const boxes = items.map((q) => {
+    const qb = asBox(q.questionBox);
+    const db = asBox(q.diagramBox);
+    if (!qb) return null;
+    if (!db) return [...qb] as Box;
+    return [Math.min(qb[0], db[0]), Math.min(qb[1], db[1]), Math.max(qb[2], db[2]), Math.max(qb[3], db[3])] as Box;
+  });
+  boxes.forEach((box, i) => {
+    if (!box) return;
+    const next = boxes
+      .filter((o, j): o is Box => j !== i && !!o && o[0] > box[2] - 10)
+      .filter((o) => Math.min(box[3], o[3]) - Math.max(box[1], o[1]) > 0.5 * Math.min(box[3] - box[1], o[3] - o[1]))
+      .sort((a, b) => a[0] - b[0])[0];
+    if (next && next[0] - 8 > box[2]) box[2] = next[0] - 8;
+  });
+  items.forEach((q, i) => {
+    q.questionBounds = boxToBounds(boxes[i], 1.5) ?? (isUsableBounds(q.questionBounds) ? q.questionBounds : null);
+    q.diagramBounds = boxToBounds(q.diagramBox, 1.5) ?? (isUsableBounds(q.diagramBounds) ? q.diagramBounds : null);
+    // Flagged a diagram but gave no box: the question box always contains it, the full page never helps.
+    if (q.hasDiagram && !q.diagramBounds) q.diagramBounds = q.questionBounds;
+    delete q.questionBox;
+    delete q.diagramBox;
+  });
+  return questions;
 }
 
 function safeParseJSON(text: string): any {
@@ -254,26 +308,22 @@ LATEX & MATH FORMATTING RULES (CRITICAL FOR PARSING):
 - Trigonometric: \\sin, \\cos, \\tan, \\log, \\ln.
 
 BOUNDING BOXES:
-- For EVERY question, you MUST provide a "questionBounds" object representing the bounding box of the ENTIRE question (including its text, options, and diagram if any).
-- CRITICAL - PREVENT OVERCROPPING/UNDERCROPPING:
-  * X-axis: You MUST capture the FULL width of the question. Ensure the box starts far enough left to include the question number (e.g., "19.", "Q4") and extends far enough right to include the longest line of text or option. Do NOT cut off the left or right edges! If unsure, make the width wider!
-  * Y-axis: Pay extremely close attention to the top and bottom edges. The box MUST completely encapsulate the very top of the question and the very bottom (including the last line of options or diagram). Do NOT cut off the top line or bottom line!
-- SAFE PADDING: Add a mandatory 3-5% padding on ALL sides (reduce x, reduce y, increase width, increase height) so that the extracted question is fully visible and not cut off.
-- Since a question is extracted, there definitely is a question, so you MUST accurately provide the questionBounds and it MUST NOT be null.
-- Bounding boxes are specified as percentages of the image dimensions (0 to 100).
-- Example questionBounds: {"x": 2, "y": 10, "width": 96, "height": 18}
+- For EVERY question, you MUST provide "questionBox": the box around the ENTIRE question (number, text, options and its diagram if any).
+- Boxes are arrays of 4 integers [ymin, xmin, ymax, xmax], normalized to 0-1000 (0,0 is the top-left corner of the image; 1000,1000 the bottom-right).
+- Make the box tight around the content: start at the question number, end after the last option or line. Padding is added later.
+- Since a question is extracted, there definitely is a question, so questionBox MUST NOT be null.
+- Example questionBox: [120, 55, 340, 940]
 
 DIAGRAM DETECTION:
 - A diagram is any figure, graph, circuit, ray diagram, free-body diagram, geometric shape, plot, biological anatomical drawing, or illustration.
 - TABLES: If a table is simple (just text/numbers in a grid), extract it within "latexContent" using \\begin{array} wrapped in block math delimiters $...$. DO NOT use \\begin{tabular}.
-- COMPLEX TABLES FALLBACK: If a table is highly complex, has heavily merged columns/rows, contains intricate diagrams inside cells, or cannot be accurately represented in a simple array, you MUST treat the entire table as a DIAGRAM. Set hasDiagram to true, and provide the "diagramBounds" accurately encapsulating the complex table.
-- If NO diagram exists for a question, set hasDiagram to false, latexGenerabilityScore to 0, and diagramBounds to null.
-- If a diagram EXISTS, provide "diagramBounds" as percentages of the image dimensions.
+- COMPLEX TABLES FALLBACK: If a table is highly complex, has heavily merged columns/rows, contains intricate diagrams inside cells, or cannot be accurately represented in a simple array, you MUST treat the entire table as a DIAGRAM. Set hasDiagram to true, and provide a "diagramBox" around the complex table.
+- If NO diagram exists for a question, set hasDiagram to false, latexGenerabilityScore to 0, and diagramBox to null.
+- If a diagram EXISTS, provide "diagramBox" as [ymin, xmin, ymax, xmax] normalized to 0-1000, same as questionBox.
 - If a diagram EXISTS, you MUST output a "latexGenerabilityScore" (a number from 0 to 100) based on how well it can be reproduced using TikZ/LaTeX.
 - Simple math graphs, geometry shapes, circuits, and standard physics diagrams score 80-100.
 - Real-world photos, highly complex 3D biological drawings (e.g., heart, brain), and artistic illustrations score 0-30.
-- The diagramBounds must wrap ONLY the diagram (not the text/options), BUT you MUST include a generous extra margin/padding around it. Ensure the entire diagram is safely centered within this box with space to breathe.
-- CRITICAL - DIAGRAM CROPPING: Pay extremely close attention to the Y-axis and X-axis. Ensure the box completely encapsulates the diagram on all sides without cutting off ANY labels, axes, or parts of the drawing. Add a precise padding (2-3%) on all sides to avoid bleeding into unrelated text.
+- The diagramBox must wrap ONLY the diagram (not the question text or options), including all of its labels, axes and annotations.
 
 CLASSIFICATION (per question):
 - Subject: Physics, Chemistry, Mathematics, Biology, Computer Science, English, or other. (Choose exactly ONE. NEVER return a comma-separated list).
@@ -294,10 +344,10 @@ Respond ONLY with this exact JSON structure:
       "subject": "Subject name",
       "chapter": "Chapter or unit name",
       "topic": "Specific topic",
-      "questionBounds": {"x": 5, "y": 10, "width": 90, "height": 15},
+      "questionBox": [ymin, xmin, ymax, xmax],
       "hasDiagram": true or false,
       "latexGenerabilityScore": 85,
-      "diagramBounds": null or {"x": 55, "y": 5, "width": 40, "height": 35},
+      "diagramBox": null or [ymin, xmin, ymax, xmax],
       "difficulty": "easy" | "medium" | "hard",
       "marks": 4
     }
@@ -696,7 +746,12 @@ export async function registerRoutes(
   });
 
   // Global concurrency limit to prevent Gemini rate limit (429) errors from multiple parallel requests
-  const globalAiLimit = pLimit(10);
+  // Gemma on the Gemini API free tier has low tokens-per-minute limits; a page costs 3-5k
+  // tokens, so more than 2 in flight gets throttled and slows every call down.
+  const geminiAiLimit = pLimit(10);
+  const gemmaAiLimit = pLimit(2);
+  const globalAiLimit = <T,>(fn: () => Promise<T>): Promise<T> =>
+    (isGemmaModel(SYSTEM_SETTINGS.extractionModel) ? gemmaAiLimit : geminiAiLimit)(fn);
 
   app.post("/api/questions/regenerate-figure", isAuthenticated, async (req: any, res) => {
     try {
@@ -871,32 +926,14 @@ Additional TikZ Guidelines:
                       answerLatex: { type: "STRING", nullable: true },
                       isSystemGeneratedAnswer: { type: "BOOLEAN" },
                       isAnswerExtractedFromImage: { type: "BOOLEAN" },
-                      questionBounds: {
-                        type: "OBJECT",
-                        properties: {
-                          x: { type: "NUMBER" },
-                          y: { type: "NUMBER" },
-                          width: { type: "NUMBER" },
-                          height: { type: "NUMBER" },
-                        },
-                        nullable: true,
-                      },
+                      questionBox: { type: "ARRAY", items: { type: "INTEGER" } },
                       hasDiagram: { type: "BOOLEAN" },
-                      diagramBounds: {
-                        type: "OBJECT",
-                        properties: {
-                          x: { type: "NUMBER" },
-                          y: { type: "NUMBER" },
-                          width: { type: "NUMBER" },
-                          height: { type: "NUMBER" },
-                        },
-                        nullable: true,
-                      },
+                      diagramBox: { type: "ARRAY", items: { type: "INTEGER" }, nullable: true },
                       latexGenerabilityScore: { type: "NUMBER", nullable: true },
                       difficulty: { type: "STRING" },
                       marks: { type: "NUMBER" },
                     },
-                    required: ["latexContent", "hasDiagram"],
+                    required: ["latexContent", "questionBox", "hasDiagram"],
                   },
                 },
               },
@@ -937,7 +974,8 @@ Additional TikZ Guidelines:
                 accumulatedTokens.total += res.usageMetadata.totalTokenCount || 0;
               }
 
-              const text = res.text || "";
+              // Some models (Gemma) wrap JSON in a ``` fence even in JSON mode.
+              const text = (res.text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
               // Validate it's not brutally truncated
               if (text && !text.endsWith("}") && !text.endsWith("]")) {
                 throw new Error("JSON generation truncated");
@@ -964,6 +1002,7 @@ Additional TikZ Guidelines:
             } else if (extractedData?.questions && Array.isArray(extractedData.questions)) {
               questionsArray = extractedData.questions;
             }
+            normalizeQuestionBoxes(questionsArray);
 
             if (!Array.isArray(questionsArray) || questionsArray.length === 0) {
               console.error("Failed to extract questions. Parsed data:", extractedData);
@@ -2302,7 +2341,7 @@ Diagram: ${item.user.diagramLatex !== undefined ? item.user.diagramLatex : (item
             continue;
           }
 
-          const questions = parsed.questions || [parsed];
+          const questions = normalizeQuestionBoxes(parsed.questions || [parsed]);
           const fileName = `source_${Date.now()}_${Math.random().toString(36).substring(7)}`;
           const uploadedUrl = await uploadImageToSupabase(file.buffer, fileName, req.headers.authorization);
           const originalImageUrl = uploadedUrl;
@@ -2444,7 +2483,7 @@ Diagram: ${item.user.diagramLatex !== undefined ? item.user.diagramLatex : (item
 
           const parsed = safeParseJSON(responseText);
           if (!parsed) return;
-          const questions = parsed.questions || [];
+          const questions = normalizeQuestionBoxes(parsed.questions || []);
 
           const questionsCount = questions.length;
           const basePromptTokens = Math.ceil(totalPromptTokens / (questionsCount || 1));
