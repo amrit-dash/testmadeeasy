@@ -38,12 +38,12 @@ function getAi(): GoogleGenAI {
     const baseUrl = resolveGeminiBaseUrl();
     aiClient = new GoogleGenAI({
       apiKey,
-      ...(baseUrl ? {
-        httpOptions: {
-          apiVersion: "",
-          baseUrl,
-        }
-      } : {})
+      httpOptions: {
+        // Gemma on the free tier occasionally stalls for many minutes; cut the call and let
+        // the caller's retry try again instead of blocking the job.
+        timeout: 150_000,
+        ...(baseUrl ? { apiVersion: "", baseUrl } : {}),
+      },
     });
   }
   return aiClient;
@@ -332,8 +332,9 @@ CLASSIFICATION (per question):
 - Difficulty: "easy", "medium", or "hard".
 - Marks: Estimate — MCQ: 1-2, short answer: 2-3, numerical: 3-4, long answer: 5-10.
 
-Respond ONLY with this exact JSON structure:
+Respond ONLY with this exact JSON structure. Fill "questionNumbers" FIRST with every question number you can see on the page (e.g. ["1", "2", "3", "4"]), then return one entry in "questions" for each of them:
 {
+  "questionNumbers": ["1", "2", ...],
   "questions": [
     {
       "latexContent": "The main question text with all LaTeX (excluding options and solutions)",
@@ -355,7 +356,7 @@ Respond ONLY with this exact JSON structure:
 }
 
 If the page has NO extractable questions (only theory/examples), respond with:
-{"questions": []}`;
+{"questionNumbers": [], "questions": []}`;
 
 function normalizeForComparison(text: string): string {
   return text
@@ -912,7 +913,12 @@ Additional TikZ Guidelines:
 
             const extractionSchema = {
               type: "OBJECT",
+              propertyOrdering: ["questionNumbers", "questions"],
+              required: ["questionNumbers", "questions"],
               properties: {
+                // Listed before "questions" so the model counts the page first; used to catch
+                // responses that silently stop after the first question.
+                questionNumbers: { type: "ARRAY", items: { type: "STRING" } },
                 questions: {
                   type: "ARRAY",
                   items: {
@@ -941,9 +947,12 @@ Additional TikZ Guidelines:
 
 
 
+            let retryReason: "truncated" | "incomplete" | null = null;
             const runExtraction = async (attemptCount: number) => {
-              const promptText = attemptCount > 1
+              const promptText = attemptCount > 1 && retryReason === "truncated"
                 ? MULTI_QUESTION_EXTRACTION_PROMPT + "\n\nCRITICAL INSTRUCTION: Your previous response was too long and got truncated! You MUST be extremely concise this time to fit within token limits."
+                : attemptCount > 1 && retryReason === "incomplete"
+                ? MULTI_QUESTION_EXTRACTION_PROMPT + "\n\nCRITICAL INSTRUCTION: Your previous response listed more question numbers than it extracted. Return one entry in \"questions\" for EVERY number in \"questionNumbers\"."
                 : MULTI_QUESTION_EXTRACTION_PROMPT;
 
               const maxOutputTokens = getMaxOutputTokens(SYSTEM_SETTINGS.extractionModel);
@@ -978,7 +987,15 @@ Additional TikZ Guidelines:
               const text = (res.text || "").trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
               // Validate it's not brutally truncated
               if (text && !text.endsWith("}") && !text.endsWith("]")) {
+                retryReason = "truncated";
                 throw new Error("JSON generation truncated");
+              }
+              const parsedCheck = safeParseJSON(text);
+              const listed = Array.isArray(parsedCheck?.questionNumbers) ? parsedCheck.questionNumbers.length : 0;
+              const got = Array.isArray(parsedCheck?.questions) ? parsedCheck.questions.length : 0;
+              if (listed > got && attemptCount < 3) {
+                retryReason = "incomplete";
+                throw new Error(`Extracted ${got} of ${listed} listed questions`);
               }
               return { text, usage: res.usageMetadata };
             };
