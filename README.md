@@ -13,7 +13,13 @@
 
 TestMadeEasy is a question-paper builder for coaching teachers. You photograph a page from a reference book, and the open-weight **Gemma 4** model pulls every question off it as clean LaTeX: options, subject, chapter, topic, difficulty, marks, and where any diagram sits. The questions land in your own question bank. You pick the ones you want, add your institute's logo, colour and watermark, and print a test paper plus its answer key.
 
-It's built for the small coaching institutes in India that run weekly JEE, NEET and board-exam tests and currently retype every question by hand.
+It's built for the small coaching institutes in India that run weekly JEE, NEET and board-exam tests and currently pay a DTP operator to retype every question by hand.
+
+**Demo video:** [youtu.be/lA2mvoYwOtQ](https://youtu.be/lA2mvoYwOtQ)
+
+[![Textbook photo in, branded test paper out](docs/images/cover.png)](https://youtu.be/lA2mvoYwOtQ)
+
+Want to try it without your own pages? The 4 practice sheets in [`docs/images`](docs/images) (physics, chemistry, maths, biology, all original questions) are what the demo uses.
 
 ## What it does
 
@@ -151,7 +157,7 @@ docs/                 Feature list and user guide
 
 ## Team
 
-Built by **Amrit Dash** and **Akash Agarwal**.
+Built by **Amrit Dash** and **Akash Agrawal**.
 
 ## License
 
