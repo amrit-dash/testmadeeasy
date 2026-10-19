@@ -37,7 +37,7 @@ function loadMathJax(): Promise<void> {
         minScale: 0.5,
         matchFontHeight: true,
         mtextInheritFont: true,
-        fontURL: 'https://cdn.jsdelivr.net/npm/mathjax@3/es5/output/chtml/fonts/woff-v2',
+        fontURL: 'https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/output/chtml/fonts/woff-v2',
       },
       startup: {
         ready: () => {
@@ -50,11 +50,11 @@ function loadMathJax(): Promise<void> {
 
     const fontLink = document.createElement("link");
     fontLink.rel = "stylesheet";
-    fontLink.href = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/output/chtml/fonts/woff-v2/MathJax_Main-Regular.woff2";
+    fontLink.href = "https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/output/chtml/fonts/woff-v2/MathJax_Main-Regular.woff2";
     document.head.appendChild(fontLink);
 
     const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js";
+    script.src = "https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-chtml.js";
     script.async = true;
     document.head.appendChild(script);
   });
